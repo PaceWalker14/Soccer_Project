@@ -41,86 +41,90 @@ ids 0..n-1. Write one team, not one per side.
 The full API is in the student guide that came with this download.
 """
 
-from soccer import PlayerAction, TeamAction, TeamController, direction
+"""my-team/team.py - a complete, working first team."""
+
+from soccer import (
+    TeamAction, TeamController, clamp, closest_to_ball, direction, distance,
+)
 
 
 class MyTeam(TeamController):
-    # Put your own name and student number here.
-    name = "my_team"
+    name = "Connor Pace"
     version = "1"
 
-    def initial_formation(self, field):
-        """Where your team stands at every kickoff. Optional — delete for the default.
-
-        One (x, y) per player in slot order, slot 0 the goalkeeper. It has to be
-        inside the pitch, on your own half and outside the centre circle; a spot
-        that is not gets moved to the nearest one that is, rather than refused.
-        """
-        keeper_x = field.my_goal[0] + field.player_radius * 2
-        # Just outside the centre circle: as close to the ball as the rules
-        # allow, which is where the kickoff is won or lost.
-        forward_x = -field.centre_circle_radius - 1.0
-        return [
-            (keeper_x, 0.0),        # keeper
-            (-20.0, -12.0),         # left back
-            (-20.0, 12.0),          # right back
-            (forward_x, -6.0),      # left forward
-            (forward_x, 6.0),       # right forward
-        ]
-
     def act(self, obs):
-        """Called on every tick. Return one action per player.
+        # The one method the engine calls. Everything starts with deciding
+        # what kind of moment this is; this team asks the simplest question
+        # there is, and you should expect to outgrow it.
+        if closest_to_ball(obs):
+            return self.on_the_ball(obs)
+        return self.off_the_ball(obs)
 
-        The first thing this does is work out whose ball it is, because almost
-        everything else follows from that. `obs.ball.controlling_team == 0` is
-        the engine's own reading of possession, and it persists while the ball
-        runs loose. `closest_to_ball(obs)` — import it from `soccer` — is the
-        other way to ask, and it flips the moment somebody outruns you. They
-        disagree often, and choosing between them is your first real decision.
-
-        Your split does not have to be this one, either. It can be per player,
-        or by where the ball is on the pitch, or something else entirely.
-        """
+    def on_the_ball(self, obs):
         actions = TeamAction()
-        ours = obs.ball.controlling_team == 0
         chaser = obs.closest_my_player_to(obs.ball.position)
 
+        # Every one of your players goes through this loop exactly once and
+        # leaves it with exactly one action.
         for player in obs.my_players:
-            nearest = player.id == chaser.id
+            if player.id == 0:
+                # Keeper: hold the goal line, slide across with the ball.
+                mouth = obs.field.goal_width / 2
+                spot = (obs.my_goal[0] + 2.0,
+                        clamp(obs.ball.position[1], -mouth, mouth))
+                actions.move(player.id, direction(player.position, spot))
 
-            if ours and nearest:
-                # Ours, and I am the one on it: have a go at goal. Check
-                # can_kick first — a kick from out of range is a wasted tick,
-                # and comes back to you as a "kick_rejected" event.
+            elif player.id == chaser.id:
+                # The nearest player, and only that one, goes to the ball.
                 if obs.can_kick(player.id):
-                    actions.set(
+                    # Power sized to the distance: see "How far a kick goes".
+                    gap = distance(player.position, obs.opponent_goal)
+                    actions.kick(
                         player.id,
-                        PlayerAction(
-                            movement=direction(player.position, obs.ball.position),
-                            kick_direction=direction(player.position, obs.opponent_goal),
-                            kick_power=1.0,
-                        ),
+                        direction(player.position, obs.opponent_goal),
+                        kick_power=min(1.0, gap / 33.0),
                     )
                 else:
                     actions.move(
-                        player.id, direction(player.position, obs.ball.position)
+                        player.id,
+                        direction(player.position, obs.ball.position),
                     )
 
-            elif ours:
-                # Ours, and somebody else is on it: get up the pitch. Running
-                # at the goal puts all four of you in the same place, which is
-                # the first thing worth fixing — nobody can receive a pass
-                # standing on top of the carrier.
+            else:
+                # Everyone else spreads out ahead of the ball, one lane each.
+                # Two lines, and no cleverness at all: the lane is fixed to the
+                # slot, so these four never swap sides however the play moves.
+                lane = (player.id - 2) * (obs.field.height * 0.2)
+                spot = (obs.ball.position[0] + 15.0, lane)
+                actions.move(player.id, direction(player.position, spot))
+
+        return actions
+
+    def off_the_ball(self, obs):
+        actions = TeamAction()
+        chaser = obs.closest_my_player_to(obs.ball.position)
+
+        for player in obs.my_players:
+            if player.id == 0:
+                mouth = obs.field.goal_width / 2
+                spot = (obs.my_goal[0] + 2.0,
+                        clamp(obs.ball.position[1], -mouth, mouth))
+                actions.move(player.id, direction(player.position, spot))
+
+            elif player.id == chaser.id:
                 actions.move(
-                    player.id, direction(player.position, obs.opponent_goal)
+                    player.id, direction(player.position, obs.ball.position)
                 )
 
-            elif nearest:
-                # Theirs, and I am the closest: go and win it back.
-                actions.move(player.id, direction(player.position, obs.ball.position))
-
             else:
-                # Theirs, and somebody else is closer: get behind the ball.
-                actions.move(player.id, direction(player.position, obs.field.my_goal))
+                # Mark goalside: stand between the nearest opponent and the
+                # goal you defend, which is always at -x. Nothing stops two of
+                # your players picking the same opponent — see section 11.
+                them = obs.closest_opponent_to(player.position)
+                if them is None:
+                    spot = obs.my_goal
+                else:
+                    spot = (them.position[0] - 3.0, them.position[1])
+                actions.move(player.id, direction(player.position, spot))
 
         return actions
