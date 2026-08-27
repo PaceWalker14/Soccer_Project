@@ -1,0 +1,21 @@
+# The course scaffold: engine, SDK, docs, launcher. All of it comes from the
+# course download and none of it is mine to version.
+/engine/
+/student-sdk/
+/tools/
+/configs/
+/docs/
+/examples/
+/bootstrap.py
+/launch.py
+/start.sh
+/START.cmd
+/VERSION
+
+# Team identity file: holds a real name and student number.
+/my-team/team.toml
+
+# Match recordings and Python bytecode.
+/replays/
+__pycache__/
+*.pyc
