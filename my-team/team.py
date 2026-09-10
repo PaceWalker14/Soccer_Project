@@ -1,5 +1,9 @@
+import math
+import random
+
 from soccer import (
     TeamAction, TeamController, clamp, closest_to_ball, direction, distance,
+    normalise,
 )
 
 # Ball speed kept after a wall bounce. The engine does not publish this on
@@ -21,6 +25,14 @@ SHAPE_LEAD = 10
 # tenth of a second, which is far finer than the difference matters, and it
 # keeps a long horizon cheap enough to run every tick.
 SCAN_STEP = 2
+
+# How far a player stands off the centre circle during their restart. The
+# player radius alone leaves one unit of margin, and a player at top speed
+# coasts four after they stop pushing, which is where the fouls came from.
+CIRCLE_STANDOFF = 2.0
+
+# How far off his line the keeper stands.
+KEEPER_DEPTH = 2.0
 
 
 def ball_path(obs, ticks=HORIZON):
@@ -114,7 +126,8 @@ def their_restart(obs):
 
 def outside_circle(obs, spot):
     """The same target, pushed clear of the centre circle."""
-    edge = obs.field.centre_circle_radius + obs.field.player_radius
+    edge = (obs.field.centre_circle_radius + obs.field.player_radius
+            + CIRCLE_STANDOFF)
     gap = distance(spot, (0.0, 0.0))
     if gap >= edge:
         return spot
@@ -123,9 +136,132 @@ def outside_circle(obs, spot):
     return (spot[0] * edge / gap, spot[1] * edge / gap)
 
 
+def kick_aim(obs, target, power):
+    """The direction to kick so the ball ends up travelling at `target`.
+
+    A kick adds to the ball's velocity rather than replacing it, so a ball
+    that is already rolling leaves at the sum of the two and not along the
+    line it was struck. Aimed at the middle of a goal there is enough of the
+    mouth either side to absorb that; aimed at a corner there is none, and the
+    same shot that used to be saved now misses entirely.
+
+    So solve for it instead. We want ``v + p*d`` to point at the target for
+    some unit ``d``, i.e. ``p*d = k*u - v`` with ``u`` the unit vector to the
+    target and ``k`` the speed the ball leaves at. Requiring ``d`` to be a unit
+    vector makes that a quadratic in ``k``, and the larger root is the one that
+    sends the ball forwards.
+
+    Falls back to the straight line when the ball is crossing too fast for a
+    kick of this power to redirect it, which is then the best there is.
+    """
+    bx, by = obs.ball.position
+    ux, uy = normalise((target[0] - bx, target[1] - by))
+    vx, vy = obs.ball.velocity
+    p = power * obs.field.kick_impulse
+
+    along = ux * vx + uy * vy
+    disc = along * along - (vx * vx + vy * vy) + p * p
+    if disc <= 0.0:
+        return (ux, uy)
+    k = along + math.sqrt(disc)
+    return normalise((k * ux - vx, k * uy - vy))
+
+
 class MyTeam(TeamController):
     name = "Connor Pace"
-    version = "2"
+    version = "6"
+
+    # How far towards a post a shot is aimed, as a fraction of the goal mouth.
+    # 1.0 is the inside of the post itself, which is missed about as often as
+    # it is hit; this keeps the ball inside the frame while still asking the
+    # keeper to cover the full width of the goal.
+    SHOT_INSET = 0.85
+
+    # Spread applied inside the half of the goal the shot has picked, so two
+    # shots from the same place do not go to the same spot.
+    SHOT_JITTER = 0.22
+
+    # Both are rebuilt by `reset`; the defaults only keep a controller that
+    # never had one called from raising on its first tick.
+    _rng = random.Random(0)
+    _reach = None
+
+    def reset(self, seed):
+        """Per-match state.
+
+        Seeding from the match seed rather than the clock is what keeps a
+        varied shot from costing reproducibility: the same seed still replays
+        into the same match.
+        """
+        self._rng = random.Random(seed)
+        self._reach = None
+
+    def their_keeper(self, obs):
+        """Whoever is guarding their goal, whatever slot they keep them in.
+
+        Asked as "nearest opponent to the goal they defend" rather than read
+        off a fixed id, so a side that does not use slot 0 as a keeper — or
+        that has lost that player to a foul — still gets read correctly.
+        """
+        return obs.closest_opponent_to(obs.opponent_goal)
+
+    def aim(self, obs, shooter):
+        """The half of their goal their keeper is not standing in.
+
+        Spreading a shot across the middle of the mouth still aims it at the
+        one player paid to stand there. The keeper can only be on one side of
+        the goal at a time, so the shot goes to the other one: the corner
+        furthest from where they will be when the ball arrives, pulled in off
+        the post so it stays inside the frame.
+        """
+        f = obs.field
+        mouth = f.goal_width / 2 - f.ball_radius
+        edge = mouth * self.SHOT_INSET
+        goal_x = obs.opponent_goal[0]
+
+        keeper = self.their_keeper(obs)
+        if keeper is None:
+            return (goal_x, self._rng.uniform(-edge, edge))
+
+        # Where they will be when it gets there, not where they are now. A
+        # keeper already moving carries on doing so while the ball is in
+        # flight; ignoring that aims at the space they are in the act of
+        # leaving.
+        gap = distance(shooter.position, (goal_x, keeper.position[1]))
+        flight = obs.ticks_to_cover(gap, 1.0) / f.simulation_hz
+        keeper_y = keeper.position[1] + keeper.velocity[1] * flight
+
+        # Whichever post they are further from. Ties, and a keeper standing
+        # dead centre, go to a random side rather than always the same one.
+        if keeper_y > 0.0:
+            target = -edge
+        elif keeper_y < 0.0:
+            target = edge
+        else:
+            target = self._rng.choice((-edge, edge))
+
+        # Jitter inwards only, so varying the shot never walks it past a post.
+        target -= target * self._rng.random() * self.SHOT_JITTER
+        return (goal_x, target)
+
+    def marking(self, obs, defenders):
+        """One opponent each, the most dangerous taken first.
+
+        Asking each defender for the opponent nearest to *them* leaves two
+        standing on the same man while the dangerous one runs free. Walking
+        the threats instead - nearest the goal we defend first - and giving
+        each of them the closest defender still unassigned fixes both, and
+        leaves their keeper unmarked, which is where he is least trouble.
+        """
+        free = list(defenders)
+        pairs = {}
+        for them in sorted(obs.opponents, key=lambda o: o.position[0]):
+            if not free:
+                break
+            mine = min(free, key=lambda p: distance(p.position, them.position))
+            free.remove(mine)
+            pairs[mine.id] = them
+        return pairs
 
     def act(self, obs):
         # The one method the engine calls. Everything starts with deciding
@@ -143,7 +279,14 @@ class MyTeam(TeamController):
 
     def meeting_points(self, obs, path):
         """Where each outfield player would meet the ball, and how soon."""
-        reach = reach_table(obs, len(path) - 1)
+        # The table depends only on the physics, and those do not change while
+        # a match is running, so it is built on the first tick and reused for
+        # the rest. Rebuilding it every tick was about a fifth of the whole
+        # decision, and the decision time is what separates teams on equal
+        # points.
+        reach = self._reach
+        if reach is None or len(reach) < len(path):
+            reach = self._reach = reach_table(obs, len(path) - 1)
         meets = {
             player.id: intercept(player, path, reach)
             for player in obs.my_players
@@ -164,11 +307,14 @@ class MyTeam(TeamController):
         if obs.can_kick(keeper.id):
             # Clear it upfield, hard, and away from the middle.
             aim = (obs.opponent_goal[0], obs.ball.position[1] * 3.0)
-            actions.kick(keeper.id, direction(keeper.position, aim),
-                         kick_power=1.0)
+            actions.kick(keeper.id, kick_aim(obs, aim, 1.0), kick_power=1.0)
             return
+        # Track the ball's y, and stay deep. Coming out to narrow the angle
+        # only looks right: a block is not a save here, because the ball keeps
+        # most of its speed off a body. The clearance above is the save, and
+        # you have to be on the ball to make it.
         mouth = obs.field.goal_width / 2
-        spot = (obs.my_goal[0] + 2.0, clamp(lead[1], -mouth, mouth))
+        spot = (obs.my_goal[0] + KEEPER_DEPTH, clamp(lead[1], -mouth, mouth))
         actions.move(keeper.id, direction(keeper.position, spot))
 
     def on_the_ball(self, obs):
@@ -191,13 +337,12 @@ class MyTeam(TeamController):
             elif player.id == chaser_id:
                 # The one player meeting the ball; nobody else follows it.
                 if obs.can_kick(player.id):
-                    # Power sized to the distance: see "How far a kick goes".
-                    gap = distance(player.position, obs.opponent_goal)
-                    actions.kick(
-                        player.id,
-                        direction(player.position, obs.opponent_goal),
-                        kick_power=min(1.0, gap / 33.0),
-                    )
+                    # Strike it, from wherever we are. Once kick_aim puts the
+                    # ball where it was aimed, a full-power shot from distance
+                    # is worth taking rather than a hoof to nobody.
+                    actions.kick(player.id,
+                                 kick_aim(obs, self.aim(obs, player), 1.0),
+                                 kick_power=1.0)
                 else:
                     # Run to where the ball is going, not where it is.
                     self.run_to(actions, obs, player,
@@ -221,6 +366,11 @@ class MyTeam(TeamController):
         lead = path[min(SHAPE_LEAD, len(path) - 1)]
         blocked = their_restart(obs)
 
+        pairs = self.marking(
+            obs,
+            [p for p in obs.my_players if p.id != 0 and p.id != chaser_id],
+        )
+
         for player in obs.my_players:
             if player.id == 0:
                 self.keep_goal(actions, obs, player, lead)
@@ -231,10 +381,9 @@ class MyTeam(TeamController):
                             meets[player.id][1], blocked)
 
             else:
-                # Mark goalside: stand between the nearest opponent and the
-                # goal you defend, which is always at -x. Nothing stops two of
-                # your players picking the same opponent — see section 11.
-                them = obs.closest_opponent_to(player.position)
+                # Mark goalside: stand between your man and the goal you
+                # defend, which is always at -x. One man each, picked above.
+                them = pairs.get(player.id)
                 if them is None:
                     spot = obs.my_goal
                 else:
