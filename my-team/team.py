@@ -21,6 +21,12 @@ HORIZON = 120
 # shape leans towards the play without over-committing.
 SHAPE_LEAD = 10
 
+# How far up the pitch of the ball the shape forms. Fifteen left a hole
+# between the line and the ball that everything they won ran straight into;
+# ten keeps the same shape near enough to cover it without giving up the
+# ground in front.
+SHAPE_DEPTH = 10.0
+
 # Only test every Nth tick of the path for a meeting point. Two ticks is a
 # tenth of a second, which is far finer than the difference matters, and it
 # keeps a long horizon cheap enough to run every tick.
@@ -36,11 +42,16 @@ KEEPER_DEPTH = 2.0
 
 
 def ball_path(obs, ticks=HORIZON):
-    """The ball's predicted position at each of the next `ticks` ticks.
+    """The ball's predicted position every SCAN_STEP ticks, for `ticks` ticks.
 
     Same maths the engine applies to the ball, so with nobody in the way this
     agrees with the simulator exactly. Built once per tick and shared by every
     player, rather than re-rolled for each of them.
+
+    The roll still runs a tick at a time, because a wall bounce has to be
+    caught on the tick it happens. Only the ticks `intercept` actually looks
+    at are kept, though: it reads one point in every SCAN_STEP, so storing all
+    of them built a hundred and twenty tuples a tick to throw away sixty.
     """
     f = obs.field
     dt = 1.0 / f.simulation_hz
@@ -50,29 +61,34 @@ def ball_path(obs, ticks=HORIZON):
     hx = f.width / 2 - f.ball_radius
     hy = f.height / 2 - f.ball_radius
 
+    friction = f.ball_friction
     path = [(x, y)]
-    for _ in range(ticks):
-        x, y = x + vx * dt, y + vy * dt
-        vx, vy = vx * f.ball_friction, vy * f.ball_friction
-        # Reflect back across whichever wall it went through.
-        if y > hy:
-            y, vy = 2 * hy - y, -vy * WALL_RESTITUTION
-        elif y < -hy:
-            y, vy = -2 * hy - y, -vy * WALL_RESTITUTION
-        if x > hx:
-            x, vx = 2 * hx - x, -vx * WALL_RESTITUTION
-        elif x < -hx:
-            x, vx = -2 * hx - x, -vx * WALL_RESTITUTION
+    for _ in range(ticks // SCAN_STEP):
+        for _ in range(SCAN_STEP):
+            x, y = x + vx * dt, y + vy * dt
+            vx, vy = vx * friction, vy * friction
+            # Reflect back across whichever wall it went through.
+            if y > hy:
+                y, vy = 2 * hy - y, -vy * WALL_RESTITUTION
+            elif y < -hy:
+                y, vy = -2 * hy - y, -vy * WALL_RESTITUTION
+            if x > hx:
+                x, vx = 2 * hx - x, -vx * WALL_RESTITUTION
+            elif x < -hx:
+                x, vx = -2 * hx - x, -vx * WALL_RESTITUTION
         path.append((x, y))
     return path
 
 
 def reach_table(obs, ticks=HORIZON):
-    """How far a player can run in 0, 1, 2 ... `ticks` ticks.
+    """How far a player can run by each point on the path.
+
+    One entry per stored point, so it lines up with `ball_path` and is indexed
+    by the same number rather than by a tick.
 
     Players accelerate from a standstill, so distance / max_speed alone is
     optimistic over short runs; this adds the ramp up to top speed. It depends
-    only on the physics, so it is built once a tick and shared by everyone.
+    only on the physics, so it is built once a match and shared by everyone.
     """
     f = obs.field
     ramp = f.max_speed / f.acceleration            # seconds spent accelerating
@@ -81,8 +97,8 @@ def reach_table(obs, ticks=HORIZON):
     slack = f.kick_range * 0.5
 
     table = []
-    for t in range(ticks + 1):
-        seconds = t / f.simulation_hz
+    for i in range(ticks // SCAN_STEP + 1):
+        seconds = i * SCAN_STEP / f.simulation_hz
         if seconds <= ramp:
             gap = 0.5 * f.acceleration * seconds * seconds
         else:
@@ -103,12 +119,11 @@ def intercept(player, path, reach):
     run for every player on every tick.
     """
     px, py = player.position
-    for t in range(0, len(path), SCAN_STEP):
-        x, y = path[t]
+    for i, (x, y) in enumerate(path):
         dx, dy = px - x, py - y
-        r = reach[t]
+        r = reach[i]
         if dx * dx + dy * dy <= r * r:
-            return t, path[t]
+            return i, (x, y)
     # Out of reach inside the horizon: head for the end of the path anyway.
     return len(path), path[-1]
 
@@ -169,7 +184,7 @@ def kick_aim(obs, target, power):
 
 class MyTeam(TeamController):
     name = "Connor Pace"
-    version = "6"
+    version = "8"
 
     # How far towards a post a shot is aimed, as a fraction of the goal mouth.
     # 1.0 is the inside of the post itself, which is missed about as often as
@@ -286,7 +301,7 @@ class MyTeam(TeamController):
         # points.
         reach = self._reach
         if reach is None or len(reach) < len(path):
-            reach = self._reach = reach_table(obs, len(path) - 1)
+            reach = self._reach = reach_table(obs, (len(path) - 1) * SCAN_STEP)
         meets = {
             player.id: intercept(player, path, reach)
             for player in obs.my_players
@@ -324,7 +339,7 @@ class MyTeam(TeamController):
         # Whoever gets there soonest, which is not always whoever is nearest.
         chaser_id = min(meets, key=lambda pid: meets[pid][0])
         # Where the ball will be while the shape is being taken up.
-        lead = path[min(SHAPE_LEAD, len(path) - 1)]
+        lead = path[min(SHAPE_LEAD // SCAN_STEP, len(path) - 1)]
         blocked = their_restart(obs)
 
         # Every one of your players goes through this loop exactly once and
@@ -352,8 +367,17 @@ class MyTeam(TeamController):
                 # Everyone else spreads out ahead of the ball, one lane each.
                 # Two lines, and no cleverness at all: the lane is fixed to the
                 # slot, so these four never swap sides however the play moves.
-                lane = (player.id - 2) * (obs.field.height * 0.2)
-                spot = (lead[0] + 15.0, lane)
+                #
+                # Centred on the pitch, which is the part that took fixing.
+                # Numbering the lanes off slot 2 put them at -12, 0, +12 and
+                # +24 on a pitch that runs from -30 to +30: the whole shape
+                # sat six units into one channel, the widest slot spent the
+                # match pinned against a touchline, and a sixth player would
+                # have been pushed off the pitch entirely.
+                outfield = len(obs.my_players) - 1
+                lane = ((player.id - (outfield + 1) * 0.5)
+                        * (obs.field.height * 0.2))
+                spot = (lead[0] + SHAPE_DEPTH, lane)
                 self.run_to(actions, obs, player, spot, blocked)
 
         return actions
@@ -363,13 +387,24 @@ class MyTeam(TeamController):
         path = ball_path(obs)
         meets = self.meeting_points(obs, path)
         chaser_id = min(meets, key=lambda pid: meets[pid][0])
-        lead = path[min(SHAPE_LEAD, len(path) - 1)]
+        lead = path[min(SHAPE_LEAD // SCAN_STEP, len(path) - 1)]
         blocked = their_restart(obs)
 
-        pairs = self.marking(
-            obs,
-            [p for p in obs.my_players if p.id != 0 and p.id != chaser_id],
-        )
+        # Whoever is next-nearest the ball supports the chaser instead of
+        # picking up a man. One player at the ball wins the race and then
+        # loses every loose ball that comes off it, and a loose ball in their
+        # half is the cheapest shot on offer. It also stops the marking line
+        # drifting into their kickoff circle, which is where the fouls were
+        # coming from.
+        bx, by = obs.ball.position
+        rest = [p for p in obs.my_players if p.id != 0 and p.id != chaser_id]
+        second_id = None
+        if len(rest) > 1:
+            second = min(rest, key=lambda p: (p.position[0] - bx) ** 2
+                         + (p.position[1] - by) ** 2)
+            second_id = second.id
+            rest = [p for p in rest if p.id != second_id]
+        pairs = self.marking(obs, rest)
 
         for player in obs.my_players:
             if player.id == 0:
@@ -379,6 +414,12 @@ class MyTeam(TeamController):
                 # Cut the ball off rather than following it around.
                 self.run_to(actions, obs, player,
                             meets[player.id][1], blocked)
+
+            elif player.id == second_id:
+                # Second man. He stands off the ball rather than on top of the
+                # chaser, and goalside of it, so a ball that squirts loose runs
+                # to him and not to them.
+                self.run_to(actions, obs, player, (bx - 6.0, by), blocked)
 
             else:
                 # Mark goalside: stand between your man and the goal you
