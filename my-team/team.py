@@ -184,7 +184,7 @@ def kick_aim(obs, target, power):
 
 class MyTeam(TeamController):
     name = "Connor Pace"
-    version = "8"
+    version = "9"
 
     # How far towards a post a shot is aimed, as a fraction of the goal mouth.
     # 1.0 is the inside of the post itself, which is missed about as often as
@@ -312,8 +312,8 @@ class MyTeam(TeamController):
             meets = {p.id: intercept(p, path, reach) for p in obs.my_players}
         return meets
 
-    def keep_goal(self, actions, obs, keeper, lead):
-        """Hold the line on the ball's predicted y, and clear anything close.
+    def keep_goal(self, actions, obs, keeper):
+        """Hold the line where a shot would arrive, and clear anything close.
 
         Standing in the way is not enough: the ball keeps most of its speed
         off a body, so a shot the keeper merely blocks carries on into the
@@ -324,12 +324,39 @@ class MyTeam(TeamController):
             aim = (obs.opponent_goal[0], obs.ball.position[1] * 3.0)
             actions.kick(keeper.id, kick_aim(obs, aim, 1.0), kick_power=1.0)
             return
-        # Track the ball's y, and stay deep. Coming out to narrow the angle
-        # only looks right: a block is not a save here, because the ball keeps
-        # most of its speed off a body. The clearance above is the save, and
-        # you have to be on the ball to make it.
-        mouth = obs.field.goal_width / 2
-        spot = (obs.my_goal[0] + KEEPER_DEPTH, clamp(lead[1], -mouth, mouth))
+        # Stay deep either way. Coming out to narrow the angle only looks
+        # right: a block is not a save here, because the ball keeps most of
+        # its speed off a body. The clearance above is the save, and you have
+        # to be on the ball to make it.
+        f = obs.field
+        mouth = f.goal_width / 2
+        line_x = obs.my_goal[0] + KEEPER_DEPTH
+        bx, by = obs.ball.position
+        vx, vy = obs.ball.velocity
+
+        # Where the ball crosses his line, if it is coming at all. Friction
+        # scales both axes by the same factor, so the whole roll is one
+        # parameter: the ball is at (bx + vx * s, by + vy * s) for an s that
+        # runs from zero to dt / (1 - friction) and no further. Solving the x
+        # of that for the keeper's line gives the s it arrives at, and the y
+        # falls straight out of it. No walking the path, and nothing to tune.
+        spot_y = None
+        if vx < -1e-6:
+            roll = (1.0 / f.simulation_hz) / (1.0 - f.ball_friction)
+            s = (line_x - bx) / vx
+            if 0.0 < s <= roll:
+                spot_y = by + vy * s
+
+        if spot_y is None:
+            # Nothing coming at him. Sit on the line from the ball to the
+            # middle of the goal, which is the middle of every shot it could
+            # take from there. Two units off his line that is a long way short
+            # of the ball's own y, and copying the ball's y instead left the
+            # whole far half of the goal open to a shot from the wing.
+            span = bx - obs.my_goal[0]
+            spot_y = by * KEEPER_DEPTH / span if span > 1e-6 else by
+
+        spot = (line_x, clamp(spot_y, -mouth, mouth))
         actions.move(keeper.id, direction(keeper.position, spot))
 
     def on_the_ball(self, obs):
@@ -347,7 +374,7 @@ class MyTeam(TeamController):
         for player in obs.my_players:
             if player.id == 0:
                 # Keeper: hold the goal line, slide across with the ball.
-                self.keep_goal(actions, obs, player, lead)
+                self.keep_goal(actions, obs, player)
 
             elif player.id == chaser_id:
                 # The one player meeting the ball; nobody else follows it.
@@ -387,7 +414,6 @@ class MyTeam(TeamController):
         path = ball_path(obs)
         meets = self.meeting_points(obs, path)
         chaser_id = min(meets, key=lambda pid: meets[pid][0])
-        lead = path[min(SHAPE_LEAD // SCAN_STEP, len(path) - 1)]
         blocked = their_restart(obs)
 
         # Whoever is next-nearest the ball supports the chaser instead of
@@ -408,7 +434,7 @@ class MyTeam(TeamController):
 
         for player in obs.my_players:
             if player.id == 0:
-                self.keep_goal(actions, obs, player, lead)
+                self.keep_goal(actions, obs, player)
 
             elif player.id == chaser_id:
                 # Cut the ball off rather than following it around.
