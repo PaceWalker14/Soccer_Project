@@ -39,6 +39,10 @@ CIRCLE_STANDOFF = 2.0
 # How far off the goal the covering defender sits.
 COVER_DEPTH = 14.0
 
+# Seconds of a player's own run to credit him with when working out
+# how soon he could meet the ball.
+MOMENTUM = 0.25
+
 # How far off his line the keeper stands.
 KEEPER_DEPTH = 2.0
 
@@ -203,7 +207,7 @@ def kick_aim(obs, target, power):
 
 class MyTeam(TeamController):
     name = "Connor Pace"
-    version = "10"
+    version = "12"
 
     # How far towards a post a shot is aimed, as a fraction of the goal mouth.
     # 1.0 is the inside of the post itself, which is missed about as often as
@@ -343,7 +347,14 @@ class MyTeam(TeamController):
 
         best_id, best_t = None, last + 1
         for player in runners:
+            # Where his own momentum carries him, not where he is standing:
+            # the reach table starts everyone from rest, which undersells a
+            # player already running at the ball and oversells one running
+            # away from it.
             px, py = player.position
+            vx, vy = player.velocity
+            px += vx * MOMENTUM
+            py += vy * MOMENTUM
             # best_t + 1, not best_t: a player who ties the leader has to be
             # seen to tie, or the tie-break below never runs and the lower id
             # loses a race the old full scan gave it.
