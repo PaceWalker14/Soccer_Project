@@ -39,16 +39,6 @@ CIRCLE_STANDOFF = 2.0
 # How far off the goal the covering defender sits.
 COVER_DEPTH = 14.0
 
-# How far down the predicted roll to look for an opponent standing in
-# it, in samples.
-BLOCK_LOOKAHEAD = 3
-
-# How near their goal the ball has to be before somebody stops taking
-# the shape and waits on the rebound, and how far off the goal line he
-# waits for it.
-REBOUND_RANGE = 25.0
-REBOUND_STANDOFF = 8.0
-
 # How far off his line the keeper stands.
 KEEPER_DEPTH = 2.0
 
@@ -61,7 +51,7 @@ class BallPath:
     remaining five and a half were being built and thrown away every tick.
     """
 
-    __slots__ = ("xs", "ys", "vx", "vy", "dt", "fr", "hx", "hy", "frozen")
+    __slots__ = ("xs", "ys", "vx", "vy", "dt", "fr", "hx", "hy")
 
     def __init__(self, obs):
         f = obs.field
@@ -74,7 +64,6 @@ class BallPath:
         self.vx, self.vy = obs.ball.velocity
         self.xs = [x]
         self.ys = [y]
-        self.frozen = None
 
     def grow(self, sample):
         """Roll forward until `sample` exists.
@@ -84,17 +73,6 @@ class BallPath:
         that is all anything reads.
         """
         xs, ys = self.xs, self.ys
-        stop = self.frozen
-        if stop is not None:
-            # It never gets past the blocker, so it is sitting on him from
-            # there on. Padding rather than truncating matters: a player who
-            # cannot beat the block can still collect the ball afterwards,
-            # and cutting the path short instead leaves him no target at all.
-            x, y = xs[stop], ys[stop]
-            while len(xs) <= sample:
-                xs.append(x)
-                ys.append(y)
-            return
         x, y, vx, vy = xs[-1], ys[-1], self.vx, self.vy
         dt, fr, hx, hy = self.dt, self.fr, self.hx, self.hy
         for _ in range(sample + 1 - len(xs)):
@@ -113,12 +91,6 @@ class BallPath:
             xs.append(x)
             ys.append(y)
         self.vx, self.vy = vx, vy
-
-    def freeze(self, sample):
-        """Nothing gets past sample `sample`; drop what was rolled beyond it."""
-        self.frozen = sample
-        del self.xs[sample + 1:]
-        del self.ys[sample + 1:]
 
     def at(self, sample):
         self.grow(sample)
@@ -231,7 +203,7 @@ def kick_aim(obs, target, power):
 
 class MyTeam(TeamController):
     name = "Connor Pace"
-    version = "11"
+    version = "10"
 
     # How far towards a post a shot is aimed, as a fraction of the goal mouth.
     # 1.0 is the inside of the post itself, which is missed about as often as
@@ -369,11 +341,6 @@ class MyTeam(TeamController):
         runners.sort(key=lambda p: (p.position[0] - bx) ** 2
                      + (p.position[1] - by) ** 2)
 
-        # The roll assumes an empty pitch, and an opponent standing on the
-        # line stops the ball dead. Looked for only in the near part of the
-        # path, because finding it further out would mean building all of it.
-        self.first_block(obs, path, min(BLOCK_LOOKAHEAD, last))
-
         best_id, best_t = None, last + 1
         for player in runners:
             px, py = player.position
@@ -390,24 +357,6 @@ class MyTeam(TeamController):
             # end of the path, which is roughly where the ball will stop.
             best_id = min(p.id for p in runners)
         return best_id, path.at(min(best_t, last))
-
-    def first_block(self, obs, path, look):
-        """Freeze the roll at the first opponent standing in it, if any."""
-        f = obs.field
-        touch = f.player_radius + f.ball_radius
-        touch *= touch
-        path.grow(look)
-        xs, ys = path.xs, path.ys
-        for them in obs.opponents:
-            ox, oy = them.position
-            for i in range(1, look + 1):
-                dx, dy = ox - xs[i], oy - ys[i]
-                if dx * dx + dy * dy <= touch:
-                    if i < look:
-                        look = i          # nobody blocks it sooner than this
-                    break
-        if look < len(xs) - 1 or path.frozen is None:
-            path.freeze(look)
 
     def keep_goal(self, actions, obs, keeper):
         """Hold the line where a shot would arrive, and clear anything close.
@@ -471,17 +420,6 @@ class MyTeam(TeamController):
         lead = path.at(SHAPE_LEAD // SCAN_STEP)
         blocked = their_restart(obs)
 
-        # Once the ball is near enough their goal for a shot to be coming,
-        # whoever is furthest forward stops taking the shape and waits for the
-        # rebound. A shot is either a goal or a loose ball in front of their
-        # keeper, and nobody was there for the second kind.
-        rebound_id = None
-        if obs.opponent_goal[0] - obs.ball.position[0] <= REBOUND_RANGE:
-            ahead = [p for p in obs.my_players
-                     if p.id != 0 and p.id != chaser_id]
-            if ahead:
-                rebound_id = max(ahead, key=lambda p: p.position[0]).id
-
         # Every one of your players goes through this loop exactly once and
         # leaves it with exactly one action.
         for player in obs.my_players:
@@ -502,13 +440,6 @@ class MyTeam(TeamController):
                 else:
                     # Run to where the ball is going, not where it is.
                     self.run_to(actions, obs, player, meet, blocked)
-
-            elif player.id == rebound_id:
-                # Waiting on the rebound, off to the side the ball is on so he
-                # is not stood in the way of the shot he is waiting for.
-                gx = obs.opponent_goal[0]
-                self.run_to(actions, obs, player,
-                            (gx - REBOUND_STANDOFF, lead[1] * 0.5), blocked)
 
             else:
                 # Everyone else spreads out ahead of the ball, one lane each.
