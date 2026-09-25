@@ -33,7 +33,7 @@ SCAN_STEP = 2
 
 # How far a player stands off the centre circle during their restart. The
 # player radius alone leaves one unit of margin, and a player at top speed
-# coasts four after they stop pushing, which is where the fouls came from.
+# coasts four after they stop pushing.
 CIRCLE_STANDOFF = 2.0
 
 # How far off the goal the covering defender sits.
@@ -73,6 +73,9 @@ PASS_MAX = 35.0
 # second. The rule of thumb for two seconds is thirty-three, and a pass that
 # slow is a pass to them.
 PASS_PACE = 20.0
+
+# Never softer than this: below it the engine counts a touch, not a pass.
+PASS_POWER_MIN = 0.5
 
 # How far back towards our own goal a pass may go and still count as helping.
 PASS_BACK = 5.0
@@ -158,7 +161,7 @@ class BallPath:
 def reach_table(obs, ticks=HORIZON):
     """How far a player can run by each point on the path.
 
-    One entry per stored point, so it lines up with `ball_path` and is indexed
+    One entry per stored point, so it lines up with `BallPath` and is indexed
     by the same number rather than by a tick.
 
     Players accelerate from a standstill, so distance / max_speed alone is
@@ -290,6 +293,45 @@ def launch(obs, direction, power):
     if speed > BALL_MAX_SPEED:
         vx, vy = vx * BALL_MAX_SPEED / speed, vy * BALL_MAX_SPEED / speed
     return vx, vy
+
+
+def pass_power(gap):
+    """How hard to strike a pass that has `gap` to travel."""
+    return clamp(gap / PASS_PACE, PASS_POWER_MIN, 1.0)
+
+
+def by_distance(point):
+    """Sort key putting players nearest `point` first, without square roots."""
+    x, y = point
+    return lambda p: (p.position[0] - x) ** 2 + (p.position[1] - y) ** 2
+
+
+def step_towards(start, end, length):
+    """`start` moved `length` towards `end`; straight up the pitch if the two
+    coincide and there is no direction to take."""
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    gap = math.hypot(dx, dy)
+    if gap > 1e-6:
+        return (start[0] + dx / gap * length, start[1] + dy / gap * length)
+    return (start[0] + length, start[1])
+
+
+def move(player, spot):
+    """Run at `spot` flat out.
+
+    A plain dict, not a PlayerAction: the engine reads either, and the typed
+    one is a frozen dataclass built five times a tick.
+    """
+    px, py = player.position
+    dx, dy = spot[0] - px, spot[1] - py
+    gap = math.hypot(dx, dy)
+    return {"movement": (dx / gap, dy / gap) if gap > 1e-9 else (0.0, 0.0)}
+
+
+def kick(direction, power):
+    """Strike the ball from a standstill."""
+    return {"movement": (0.0, 0.0), "kick_direction": direction,
+            "kick_power": power}
 
 
 def outside_circle(obs, spot):
@@ -514,10 +556,8 @@ class MyTeam(TeamController):
         bx, by = obs.ball.position
         hx = obs.field.width / 2 - 1.0
         hy = obs.field.height / 2 - 1.0
-        hz = obs.field.simulation_hz
         mates = [p for p in obs.my_players if p.id != 0 and p.id != passer.id]
-        mates.sort(key=lambda p: (p.position[0] - bx) ** 2
-                   + (p.position[1] - by) ** 2)
+        mates.sort(key=by_distance(obs.ball.position))
 
         for mate in mates:
             # Lead him: where he will be when the ball arrives, settled over
@@ -526,15 +566,14 @@ class MyTeam(TeamController):
             tx, ty = mx, my
             for _ in range(2):
                 gap = math.hypot(tx - bx, ty - by)
-                power = clamp(gap / PASS_PACE, 0.5, 1.0)
-                flight = gap / (power * obs.field.kick_impulse)
+                flight = gap / (pass_power(gap) * obs.field.kick_impulse)
                 tx = clamp(mx + mate.velocity[0] * flight, -hx, hx)
                 ty = clamp(my + mate.velocity[1] * flight, -hy, hy)
 
             gap = math.hypot(tx - bx, ty - by)
             if not PASS_MIN <= gap <= PASS_MAX or tx < bx - PASS_BACK:
                 continue
-            power = clamp(gap / PASS_PACE, 0.5, 1.0)
+            power = pass_power(gap)
             direction = kick_aim(obs, (tx, ty), power)
             if self.lane_room(obs, launch(obs, direction, power), gap) > 0.0:
                 return direction, power
@@ -569,26 +608,38 @@ class MyTeam(TeamController):
         """
         direction = self.shot(obs, player)
         if direction is not None:
-            return {"movement": (0.0, 0.0), "kick_direction": direction,
-                    "kick_power": 1.0}
+            return kick(direction, 1.0)
         found = self.pass_to(obs, player)
         if found is not None:
-            return {"movement": (0.0, 0.0), "kick_direction": found[0],
-                    "kick_power": found[1]}
+            return kick(*found)
         if obs.ball.position[0] > 0.0:
-            return {"movement": (0.0, 0.0), "kick_power": 1.0,
-                    "kick_direction": kick_aim(obs, self.aim(obs, player), 1.0)}
-        return {"movement": (0.0, 0.0),
-                "kick_direction": self.clearance(obs), "kick_power": 1.0}
+            return kick(kick_aim(obs, self.aim(obs, player), 1.0), 1.0)
+        return kick(self.clearance(obs), 1.0)
 
     def act(self, obs):
-        # The one method the engine calls. Everything starts with deciding
-        # what kind of moment this is; this team asks the simplest question
-        # there is, and you should expect to outgrow it.
-        #
-        # First, whether a restart has just begun. The goal event carries the
-        # tick it went in on, which is when the restart clock starts; a score
-        # that moved without one still counts, a tick late.
+        # The one method the engine calls.
+        self.note_restart(obs)
+
+        # Both tables depend only on the physics, and those do not change
+        # while a match is running, so they are built on the first tick and
+        # reused for the rest. Rebuilding the reach table every tick was about
+        # a fifth of the whole decision, and the decision time is what
+        # separates teams on equal points.
+        if self._reach is None:
+            self._reach = reach_table(obs)
+            self._roll = roll_table(obs)
+
+        if closest_to_ball(obs):
+            return self.on_the_ball(obs)
+        return self.off_the_ball(obs)
+
+    def note_restart(self, obs):
+        """Keep track of the tick the current restart began on.
+
+        The goal event carries the tick it went in on, which is when the
+        restart clock starts; a score that moved without one still counts, a
+        tick late.
+        """
         restarted = False
         for event in obs.events:
             if event["kind"] == "goal":
@@ -600,26 +651,12 @@ class MyTeam(TeamController):
                 self._restart = obs.tick - 1
             self._score = score
 
-        if self._reach is None:
-            self._reach = reach_table(obs)
-            self._roll = roll_table(obs)
-
-        if closest_to_ball(obs):
-            return self.on_the_ball(obs)
-        return self.off_the_ball(obs)
-
     def run_to(self, actions, obs, player, spot, blocked):
         """Send a player at a target, keeping out of their kickoff circle."""
         if blocked:
             spot = around_circle(obs, player.position,
                                  outside_circle(obs, spot))
-        # A plain dict, not a PlayerAction: the engine reads either, and the
-        # typed one is a frozen dataclass built five times a tick.
-        px, py = player.position
-        dx, dy = spot[0] - px, spot[1] - py
-        gap = math.hypot(dx, dy)
-        actions[player.id] = {
-            "movement": (dx / gap, dy / gap) if gap > 1e-9 else (0.0, 0.0)}
+        actions[player.id] = move(player, spot)
 
     def chase(self, obs, path):
         """Who meets the ball soonest, and where they meet it.
@@ -628,20 +665,12 @@ class MyTeam(TeamController):
         time nobody else is scanned past it. Nearest the ball first, because
         that player usually wins and makes the cap small straight away. The
         answer is the one a full scan per player gives, ties included.
-
-        The reach table depends only on the physics, and those do not change
-        while a match is running, so it is built on the first tick and reused
-        for the rest. Rebuilding it every tick was about a fifth of the whole
-        decision, and the decision time is what separates teams on equal
-        points.
         """
         reach = self._reach
         last = len(reach) - 1
 
-        bx, by = obs.ball.position
         runners = [p for p in obs.my_players if p.id != 0] or list(obs.my_players)
-        runners.sort(key=lambda p: (p.position[0] - bx) ** 2
-                     + (p.position[1] - by) ** 2)
+        runners.sort(key=by_distance(obs.ball.position))
 
         best_id, best_t = None, last + 1
         for player in runners:
@@ -680,13 +709,9 @@ class MyTeam(TeamController):
             # forward standing in front of him scored off his clearances.
             found = self.pass_to(obs, keeper)
             if found is not None:
-                actions[keeper.id] = {"movement": (0.0, 0.0),
-                                      "kick_direction": found[0],
-                                      "kick_power": found[1]}
+                actions[keeper.id] = kick(*found)
             else:
-                actions[keeper.id] = {"movement": (0.0, 0.0),
-                                      "kick_direction": self.clearance(obs),
-                                      "kick_power": 1.0}
+                actions[keeper.id] = kick(self.clearance(obs), 1.0)
             return
         # Stay deep either way. Coming out to narrow the angle only looks
         # right: a block is not a save here, because the ball keeps most of
@@ -720,12 +745,7 @@ class MyTeam(TeamController):
             span = bx - obs.my_goal[0]
             spot_y = by * KEEPER_DEPTH / span if span > 1e-6 else by
 
-        spot = (line_x, clamp(spot_y, -mouth, mouth))
-        kx, ky = keeper.position
-        dx, dy = spot[0] - kx, spot[1] - ky
-        gap = math.hypot(dx, dy)
-        actions[keeper.id] = {
-            "movement": (dx / gap, dy / gap) if gap > 1e-9 else (0.0, 0.0)}
+        actions[keeper.id] = move(keeper, (line_x, clamp(spot_y, -mouth, mouth)))
 
     def on_the_ball(self, obs):
         actions = {}
@@ -735,28 +755,7 @@ class MyTeam(TeamController):
         # Where the ball will be while the shape is being taken up.
         lead = path.at(SHAPE_LEAD // SCAN_STEP)
         blocked = their_restart(obs, self._restart)
-
-        # One man stays back. With all four ahead of the ball, the sides that
-        # beat us left two forwards on our box and scored off whatever came
-        # out of it, with one or two of ours goalside at best.
-        spare = [p for p in obs.my_players if p.id != 0 and p.id != chaser_id]
-        sweeper_id, sweep = None, None
-        if len(spare) > 1:
-            sweep = self.sweeper_spot(obs, lead[0])
-            sweeper_id = min(spare, key=lambda p: distance(p.position, sweep)
-                             - (SWEEP_STICKY if p.id == self._sweeper else 0.0)).id
-            self._sweeper = sweeper_id
-
-        # The rest spread out ahead of the ball, one lane each, handed out in
-        # the order they already stand across the pitch so nobody has to cross
-        # anybody to get to his. Centred on the pitch, so the shape does not
-        # sit in one channel with its widest man on a touchline.
-        runners = sorted((p for p in spare if p.id != sweeper_id),
-                         key=lambda p: p.position[1])
-        lanes = {}
-        width = obs.field.height * (0.25 if len(runners) < 4 else 0.2)
-        for i, p in enumerate(runners):
-            lanes[p.id] = (i - (len(runners) - 1) * 0.5) * width
+        sweeper_id, sweep, lanes = self.attack_shape(obs, chaser_id, lead[0])
 
         # Every one of your players goes through this loop exactly once and
         # leaves it with exactly one action.
@@ -782,24 +781,46 @@ class MyTeam(TeamController):
 
         return actions
 
-    def sweeper_spot(self, obs, bx):
+    def attack_shape(self, obs, chaser_id, ball_x):
+        """Who sweeps, where, and the lane each of the others takes.
+
+        One man stays back. With all four ahead of the ball, the sides that
+        beat us left two forwards on our box and scored off whatever came out
+        of it, with one or two of ours goalside at best.
+
+        The rest spread out ahead of the ball, one lane each, handed out in
+        the order they already stand across the pitch so nobody has to cross
+        anybody to get to his. Centred on the pitch, so the shape does not sit
+        in one channel with its widest man on a touchline.
+        """
+        spare = [p for p in obs.my_players if p.id != 0 and p.id != chaser_id]
+        sweeper_id, sweep = None, None
+        if len(spare) > 1:
+            sweep = self.sweeper_spot(obs, ball_x)
+            sweeper_id = min(spare, key=lambda p: distance(p.position, sweep)
+                             - (SWEEP_STICKY if p.id == self._sweeper else 0.0)).id
+            self._sweeper = sweeper_id
+
+        runners = sorted((p for p in spare if p.id != sweeper_id),
+                         key=lambda p: p.position[1])
+        width = obs.field.height * (0.25 if len(runners) < 4 else 0.2)
+        lanes = {p.id: (i - (len(runners) - 1) * 0.5) * width
+                 for i, p in enumerate(runners)}
+        return sweeper_id, sweep, lanes
+
+    def sweeper_spot(self, obs, ball_x):
         """Goalside of their most advanced player, and well behind the ball.
 
         Their keeper is left out of "most advanced", or a side with nobody
         forward would have the sweeper marking the far goal.
         """
         keeper = self.their_keeper(obs)
-        field = [o for o in obs.opponents
-                 if keeper is None or o.id != keeper.id] or obs.opponents
-        them = min(field, key=lambda o: o.position[0])
-        tx, ty = them.position
-        gx, gy = obs.my_goal
-        dx, dy = gx - tx, gy - ty
-        gap = math.hypot(dx, dy)
-        if gap > 1e-6:
-            tx, ty = tx + dx / gap * SWEEP_GOALSIDE, ty + dy / gap * SWEEP_GOALSIDE
-        x = min(tx, bx - SWEEP_BEHIND, SWEEP_LINE)
-        return (max(x, gx + COVER_DEPTH), ty)
+        outfield = [o for o in obs.opponents
+                    if keeper is None or o.id != keeper.id] or obs.opponents
+        them = min(outfield, key=lambda o: o.position[0])
+        x, y = step_towards(them.position, obs.my_goal, SWEEP_GOALSIDE)
+        x = min(x, ball_x - SWEEP_BEHIND, SWEEP_LINE)
+        return (max(x, obs.my_goal[0] + COVER_DEPTH), y)
 
     def off_the_ball(self, obs):
         actions = {}
@@ -810,16 +831,12 @@ class MyTeam(TeamController):
         # Whoever is next-nearest the ball supports the chaser instead of
         # picking up a man. One player at the ball wins the race and then
         # loses every loose ball that comes off it, and a loose ball in their
-        # half is the cheapest shot on offer. It also stops the marking line
-        # drifting into their kickoff circle, which is where the fouls were
-        # coming from.
+        # half is the cheapest shot on offer.
         bx, by = obs.ball.position
         rest = [p for p in obs.my_players if p.id != 0 and p.id != chaser_id]
         second_id = None
         if len(rest) > 1:
-            second = min(rest, key=lambda p: (p.position[0] - bx) ** 2
-                         + (p.position[1] - by) ** 2)
-            second_id = second.id
+            second_id = min(rest, key=by_distance(obs.ball.position)).id
             rest = [p for p in rest if p.id != second_id]
         # One of the rest drops in front of the keeper instead of taking a
         # man. Marking stands a defender beside an opponent, which is no use
@@ -848,14 +865,7 @@ class MyTeam(TeamController):
             elif player.id == cover_id:
                 # On the line from the ball to the goal we defend, so a shot
                 # has to beat a body before it reaches the keeper.
-                gx, gy = obs.my_goal
-                dx, dy = bx - gx, by - gy
-                gap = math.hypot(dx, dy)
-                if gap > 1e-6:
-                    spot = (gx + dx / gap * COVER_DEPTH,
-                            gy + dy / gap * COVER_DEPTH)
-                else:
-                    spot = (gx + COVER_DEPTH, gy)
+                spot = step_towards(obs.my_goal, obs.ball.position, COVER_DEPTH)
                 self.run_to(actions, obs, player, spot, blocked)
 
             else:
